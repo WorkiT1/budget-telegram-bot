@@ -31,7 +31,7 @@ ADMIN_ID = 769150530
 # Якщо True — тільки дозволені користувачі можуть користуватися ботом
 REQUIRE_APPROVAL = True
 
-# Коди інвайту. Потім зможеш додати свої.
+# Коди інвайту
 VALID_INVITE_CODES = {"start123", "vip123", "friend123"}
 
 
@@ -107,7 +107,10 @@ def upsert_user(telegram_user_id: int, username: str | None, first_name: str | N
     cur = conn.cursor()
     now = datetime.now().isoformat()
 
-    cur.execute("SELECT access_status, invite_code FROM users WHERE telegram_user_id = ?", (telegram_user_id,))
+    cur.execute(
+        "SELECT access_status, invite_code FROM users WHERE telegram_user_id = ?",
+        (telegram_user_id,)
+    )
     existing = cur.fetchone()
 
     if existing:
@@ -139,7 +142,10 @@ def upsert_user(telegram_user_id: int, username: str | None, first_name: str | N
             status = "active"
 
         cur.execute("""
-            INSERT INTO users (telegram_user_id, username, first_name, access_status, invite_code, created_at, last_seen_at)
+            INSERT INTO users (
+                telegram_user_id, username, first_name, access_status,
+                invite_code, created_at, last_seen_at
+            )
             VALUES (?, ?, ?, ?, ?, ?, ?)
         """, (
             telegram_user_id,
@@ -383,22 +389,25 @@ def normalize_category(raw):
 
     return mapping.get(value, value)
 
+
 def try_rule_based_intent(user_text: str):
     text = user_text.strip().lower().replace(",", ".")
+    clean = " ".join(text.split())
 
-    # Встановлення бюджету
-    budget_phrases = [
+    budget_prefixes = [
         "бюджет ",
         "мій бюджет ",
         "мой бюджет ",
         "my budget ",
-        "set budget ",
-        "budget "
+        "budget ",
+        "встанови бюджет ",
+        "постав бюджет ",
+        "set budget "
     ]
 
-    for phrase in budget_phrases:
-        if text.startswith(phrase):
-            rest = text[len(phrase):].strip()
+    for prefix in budget_prefixes:
+        if clean.startswith(prefix):
+            rest = clean[len(prefix):].strip()
             try:
                 amount = float(rest)
                 return {
@@ -407,19 +416,22 @@ def try_rule_based_intent(user_text: str):
                     "category": None,
                     "description": None,
                     "keyword": None,
-                    "reply_text": "Добре, встановлюю бюджет."
+                    "reply_text": "Бюджет встановлено."
                 }
             except ValueError:
                 pass
 
-    # Питання про поточний бюджет
     get_budget_phrases = [
         "який у мене бюджет",
+        "який мій бюджет",
+        "покажи бюджет",
+        "мій бюджет",
         "мой бюджет",
         "what is my budget",
+        "show my budget",
         "mis on mu eelarve"
     ]
-    if text in get_budget_phrases:
+    if clean in get_budget_phrases:
         return {
             "intent": "get_budget",
             "amount": None,
@@ -429,24 +441,23 @@ def try_rule_based_intent(user_text: str):
             "reply_text": "Ось твій поточний бюджет."
         }
 
-    # Скільки витрачено
     get_spent_phrases = [
         "скільки я витратив",
         "скільки я витратила",
         "сколько я потратил",
+        "сколько я потратила",
         "how much did i spend"
     ]
-    if text in get_spent_phrases:
+    if clean in get_spent_phrases:
         return {
             "intent": "get_spent",
             "amount": None,
             "category": None,
             "description": None,
             "keyword": None,
-            "reply_text": "Ось скільки ти вже витратив."
+            "reply_text": "Ось скільки витрачено."
         }
 
-    # Скільки залишилось
     get_remaining_phrases = [
         "скільки лишилось",
         "скільки залишилось",
@@ -454,7 +465,7 @@ def try_rule_based_intent(user_text: str):
         "сколько осталось",
         "how much is left"
     ]
-    if text in get_remaining_phrases:
+    if clean in get_remaining_phrases:
         return {
             "intent": "get_remaining",
             "amount": None,
@@ -465,6 +476,8 @@ def try_rule_based_intent(user_text: str):
         }
 
     return None
+
+
 def analyze_message_with_ai(user_text: str, memory_hint: str) -> dict:
     schema = {
         "type": "object",
@@ -526,13 +539,11 @@ def analyze_message_with_ai(user_text: str, memory_hint: str) -> dict:
 - Якщо користувач пише "бюджет 1000", "мій бюджет 1000", "мой бюджет 1000", "my budget 1000" — це set_budget
 - Якщо користувач пише "який у мене бюджет", "мой бюджет?", "what is my budget" — це get_budget
 - Якщо в повідомленні є слово про бюджет і конкретне число без знака питання — найчастіше це set_budget
-- reply_text не повинен містити конкретних чисел бюджету, залишку, витрат або сум з бази.
-- reply_text має бути лише короткою фразою без вигаданих чисел.
-- Для intent get_budget, get_remaining, get_spent, check_purchase reply_text має бути загальною фразою, наприклад:
-  "Ось твоя інформація."
-  "Зараз покажу."
-  "Перевіряю."
-- Ніколи не вигадуй числа у reply_text.
+- reply_text не повинен містити конкретних чисел бюджету, залишку, витрат або сум з бази
+- reply_text має бути короткою загальною фразою без вигаданих чисел
+- Для intent get_budget, get_remaining, get_spent, check_purchase reply_text має бути загальним, без цифр
+- Ніколи не вигадуй числа у reply_text
+
 Пам'ять:
 {memory_hint}
 
@@ -609,16 +620,16 @@ async def process_finance_text(update: Update, user_text: str):
 
     rule_result = try_rule_based_intent(user_text)
 
-if rule_result:
-    data = rule_result
-else:
-    data = analyze_message_with_ai(user_text, memory_hint)
+    if rule_result:
+        data = rule_result
+    else:
+        data = analyze_message_with_ai(user_text, memory_hint)
+
     intent = data.get("intent")
     amount = data.get("amount")
     category = normalize_category(data.get("category"))
     description = (data.get("description") or user_text).strip()
     keyword = (data.get("keyword") or "").strip().lower()
-    reply_text = data.get("reply_text") or "Готово."
 
     if intent == "teach_category":
         if not keyword or category == "other":
@@ -626,7 +637,7 @@ else:
             return
 
         save_category_memory(user_id, keyword, category)
-        await update.message.reply_text(f"{reply_text}\nЗапам'ятав: {keyword} → {category}")
+        await update.message.reply_text(f"Запам'ятав: {keyword} → {category}")
         return
 
     if intent == "correct_last_category":
@@ -645,7 +656,7 @@ else:
             if last_description:
                 save_category_memory(user_id, last_description, category)
 
-        await update.message.reply_text(f"{reply_text}\nОстанню витрату оновлено на категорію: {category}")
+        await update.message.reply_text(f"Останню витрату оновлено на категорію: {category}")
         return
 
     if intent == "add_expense":
@@ -660,74 +671,77 @@ else:
         add_expense(user_id, amount_cents, category, description)
 
         await update.message.reply_text(
-            f"{reply_text}\nСума: {cents_to_eur(amount_cents)}\nКатегорія: {category}\nОпис: {description}"
+            f"Витрату додано.\n"
+            f"Сума: {cents_to_eur(amount_cents)}\n"
+            f"Категорія: {category}\n"
+            f"Опис: {description}"
         )
         return
 
     if intent == "set_budget":
-    if amount is None:
-        await update.message.reply_text("Я зрозумів, що ти хочеш встановити бюджет, але не бачу суму.")
+        if amount is None:
+            await update.message.reply_text("Я зрозумів, що ти хочеш встановити бюджет, але не бачу суму.")
+            return
+
+        amount_cents = int(Decimal(str(amount)) * 100)
+        set_budget(user_id, amount_cents)
+
+        await update.message.reply_text(
+            f"Бюджет встановлено.\nНовий бюджет: {cents_to_eur(amount_cents)}"
+        )
         return
-
-    amount_cents = int(Decimal(str(amount)) * 100)
-    set_budget(user_id, amount_cents)
-
-    await update.message.reply_text(
-        f"Бюджет встановлено.\nНовий бюджет: {cents_to_eur(amount_cents)}"
-    )
-    return
 
     if intent == "check_purchase":
-    if amount is None:
-        await update.message.reply_text("Я зрозумів, що ти хочеш перевірити покупку, але не бачу суму.")
+        if amount is None:
+            await update.message.reply_text("Я зрозумів, що ти хочеш перевірити покупку, але не бачу суму.")
+            return
+
+        purchase_cents = int(Decimal(str(amount)) * 100)
+        left = get_remaining_budget(user_id)
+        after_purchase = left - purchase_cents
+
+        if purchase_cents <= left:
+            await update.message.reply_text(
+                f"Так, ця покупка влізає в бюджет.\n"
+                f"Зараз залишок: {cents_to_eur(left)}\n"
+                f"Після покупки залишиться: {cents_to_eur(after_purchase)}"
+            )
+        else:
+            need_more = purchase_cents - left
+            await update.message.reply_text(
+                f"Ні, ця покупка не влізає в бюджет.\n"
+                f"Зараз залишок: {cents_to_eur(left)}\n"
+                f"Не вистачає: {cents_to_eur(need_more)}"
+            )
         return
 
-    purchase_cents = int(Decimal(str(amount)) * 100)
-    left = get_remaining_budget(user_id)
-    after_purchase = left - purchase_cents
-
-    if purchase_cents <= left:
-        await update.message.reply_text(
-            f"Так, ця покупка влізає в бюджет.\n"
-            f"Зараз залишок: {cents_to_eur(left)}\n"
-            f"Після покупки залишиться: {cents_to_eur(after_purchase)}"
-        )
-    else:
-        need_more = purchase_cents - left
-        await update.message.reply_text(
-            f"Ні, ця покупка не влізає в бюджет.\n"
-            f"Зараз залишок: {cents_to_eur(left)}\n"
-            f"Не вистачає: {cents_to_eur(need_more)}"
-        )
-    return
-
     if intent == "get_budget":
-    budget = get_current_budget(user_id)
-    await update.message.reply_text(
-        f"Ось твій поточний бюджет:\n{cents_to_eur(budget)}"
-    )
-    return
+        budget = get_current_budget(user_id)
+        await update.message.reply_text(
+            f"Ось твій поточний бюджет:\n{cents_to_eur(budget)}"
+        )
+        return
 
     if intent == "get_remaining":
-    left = get_remaining_budget(user_id)
-    budget = get_current_budget(user_id)
-    spent = get_total_expenses(user_id)
-    await update.message.reply_text(
-        f"Ось твоя інформація по бюджету:\n"
-        f"Бюджет: {cents_to_eur(budget)}\n"
-        f"Витрачено: {cents_to_eur(spent)}\n"
-        f"Залишилось: {cents_to_eur(left)}"
-    )
-    return
+        left = get_remaining_budget(user_id)
+        budget = get_current_budget(user_id)
+        spent = get_total_expenses(user_id)
+        await update.message.reply_text(
+            f"Ось твоя інформація по бюджету:\n"
+            f"Бюджет: {cents_to_eur(budget)}\n"
+            f"Витрачено: {cents_to_eur(spent)}\n"
+            f"Залишилось: {cents_to_eur(left)}"
+        )
+        return
 
     if intent == "get_spent":
-    spent = get_total_expenses(user_id)
-    await update.message.reply_text(
-        f"Усього витрачено: {cents_to_eur(spent)}"
-    )
-    return
+        spent = get_total_expenses(user_id)
+        await update.message.reply_text(
+            f"Усього витрачено: {cents_to_eur(spent)}"
+        )
+        return
 
-    await update.message.reply_text(reply_text)
+    await update.message.reply_text("Не можу точно визначити намір повідомлення. Спробуй написати простіше.")
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -887,7 +901,10 @@ async def add_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         add_expense(user_id, amount_cents, category, description)
 
         await update.message.reply_text(
-            f"Записав витрату.\nСума: {cents_to_eur(amount_cents)}\nКатегорія: {category}\nОпис: {description if description else '-'}"
+            f"Записав витрату.\n"
+            f"Сума: {cents_to_eur(amount_cents)}\n"
+            f"Категорія: {category}\n"
+            f"Опис: {description if description else '-'}"
         )
     except (InvalidOperation, ValueError):
         await update.message.reply_text("Не зміг зрозуміти суму. Приклад: /add 12.50 food кава")
@@ -912,7 +929,9 @@ async def left_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     left = budget - spent
 
     await update.message.reply_text(
-        f"Бюджет: {cents_to_eur(budget)}\nВитрачено: {cents_to_eur(spent)}\nЗалишилось: {cents_to_eur(left)}"
+        f"Бюджет: {cents_to_eur(budget)}\n"
+        f"Витрачено: {cents_to_eur(spent)}\n"
+        f"Залишилось: {cents_to_eur(left)}"
     )
 
 
@@ -935,12 +954,16 @@ async def can_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if purchase_cents <= left:
             await update.message.reply_text(
-                f"Так, влізаєш.\nЗараз залишок: {cents_to_eur(left)}\nПісля покупки залишиться: {cents_to_eur(after_purchase)}"
+                f"Так, влізаєш.\n"
+                f"Зараз залишок: {cents_to_eur(left)}\n"
+                f"Після покупки залишиться: {cents_to_eur(after_purchase)}"
             )
         else:
             over = purchase_cents - left
             await update.message.reply_text(
-                f"Ні, не влізаєш у бюджет.\nЗараз залишок: {cents_to_eur(left)}\nНе вистачає: {cents_to_eur(over)}"
+                f"Ні, не влізаєш у бюджет.\n"
+                f"Зараз залишок: {cents_to_eur(left)}\n"
+                f"Не вистачає: {cents_to_eur(over)}"
             )
     except (InvalidOperation, ValueError):
         await update.message.reply_text("Не зміг зрозуміти суму. Приклад: /can 80")
