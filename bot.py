@@ -26,13 +26,18 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 DB_NAME = "budget.db"
 
 
+def get_conn():
+    return sqlite3.connect(DB_NAME)
+
+
 def init_db():
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_conn()
     cur = conn.cursor()
 
     cur.execute("""
     CREATE TABLE IF NOT EXISTS expenses (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
         amount_cents INTEGER NOT NULL,
         category TEXT NOT NULL,
         description TEXT,
@@ -43,6 +48,7 @@ def init_db():
     cur.execute("""
     CREATE TABLE IF NOT EXISTS budgets (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
         amount_cents INTEGER NOT NULL,
         created_at TEXT NOT NULL
     )
@@ -51,9 +57,11 @@ def init_db():
     cur.execute("""
     CREATE TABLE IF NOT EXISTS category_memory (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        keyword TEXT NOT NULL UNIQUE,
+        user_id INTEGER NOT NULL,
+        keyword TEXT NOT NULL,
         category TEXT NOT NULL,
-        updated_at TEXT NOT NULL
+        updated_at TEXT NOT NULL,
+        UNIQUE(user_id, keyword)
     )
     """)
 
@@ -72,21 +80,27 @@ def cents_to_eur(cents: int) -> str:
     return f"{euros:.2f} €"
 
 
-def add_expense(amount_cents: int, category: str, description: str):
-    conn = sqlite3.connect(DB_NAME)
+def add_expense(user_id: int, amount_cents: int, category: str, description: str):
+    conn = get_conn()
     cur = conn.cursor()
     cur.execute(
-        "INSERT INTO expenses (amount_cents, category, description, created_at) VALUES (?, ?, ?, ?)",
-        (amount_cents, category, description, datetime.now().isoformat())
+        """
+        INSERT INTO expenses (user_id, amount_cents, category, description, created_at)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (user_id, amount_cents, category, description, datetime.now().isoformat())
     )
     conn.commit()
     conn.close()
 
 
-def update_last_expense_category(new_category: str) -> bool:
-    conn = sqlite3.connect(DB_NAME)
+def update_last_expense_category(user_id: int, new_category: str) -> bool:
+    conn = get_conn()
     cur = conn.cursor()
-    cur.execute("SELECT id FROM expenses ORDER BY id DESC LIMIT 1")
+    cur.execute(
+        "SELECT id FROM expenses WHERE user_id = ? ORDER BY id DESC LIMIT 1",
+        (user_id,)
+    )
     row = cur.fetchone()
 
     if not row:
@@ -94,85 +108,101 @@ def update_last_expense_category(new_category: str) -> bool:
         return False
 
     expense_id = row[0]
-    cur.execute("UPDATE expenses SET category = ? WHERE id = ?", (new_category, expense_id))
+    cur.execute(
+        "UPDATE expenses SET category = ? WHERE id = ?",
+        (new_category, expense_id)
+    )
     conn.commit()
     conn.close()
     return True
 
 
-def get_last_expense():
-    conn = sqlite3.connect(DB_NAME)
+def get_last_expense(user_id: int):
+    conn = get_conn()
     cur = conn.cursor()
     cur.execute("""
         SELECT id, amount_cents, category, description, created_at
         FROM expenses
+        WHERE user_id = ?
         ORDER BY id DESC
         LIMIT 1
-    """)
+    """, (user_id,))
     row = cur.fetchone()
     conn.close()
     return row
 
 
-def set_budget(amount_cents: int):
-    conn = sqlite3.connect(DB_NAME)
+def set_budget(user_id: int, amount_cents: int):
+    conn = get_conn()
     cur = conn.cursor()
     cur.execute(
-        "INSERT INTO budgets (amount_cents, created_at) VALUES (?, ?)",
-        (amount_cents, datetime.now().isoformat())
+        """
+        INSERT INTO budgets (user_id, amount_cents, created_at)
+        VALUES (?, ?, ?)
+        """,
+        (user_id, amount_cents, datetime.now().isoformat())
     )
     conn.commit()
     conn.close()
 
 
-def get_current_budget() -> int:
-    conn = sqlite3.connect(DB_NAME)
+def get_current_budget(user_id: int) -> int:
+    conn = get_conn()
     cur = conn.cursor()
-    cur.execute("SELECT amount_cents FROM budgets ORDER BY id DESC LIMIT 1")
+    cur.execute(
+        "SELECT amount_cents FROM budgets WHERE user_id = ? ORDER BY id DESC LIMIT 1",
+        (user_id,)
+    )
     row = cur.fetchone()
     conn.close()
     return row[0] if row else 0
 
 
-def get_total_expenses() -> int:
-    conn = sqlite3.connect(DB_NAME)
+def get_total_expenses(user_id: int) -> int:
+    conn = get_conn()
     cur = conn.cursor()
-    cur.execute("SELECT COALESCE(SUM(amount_cents), 0) FROM expenses")
+    cur.execute(
+        "SELECT COALESCE(SUM(amount_cents), 0) FROM expenses WHERE user_id = ?",
+        (user_id,)
+    )
     row = cur.fetchone()
     conn.close()
     return row[0] if row else 0
 
 
-def get_remaining_budget() -> int:
-    return get_current_budget() - get_total_expenses()
+def get_remaining_budget(user_id: int) -> int:
+    return get_current_budget(user_id) - get_total_expenses(user_id)
 
 
-def save_category_memory(keyword: str, category: str):
+def save_category_memory(user_id: int, keyword: str, category: str):
     keyword = keyword.strip().lower()
     category = category.strip().lower()
 
     if not keyword:
         return
 
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_conn()
     cur = conn.cursor()
     cur.execute("""
-        INSERT INTO category_memory (keyword, category, updated_at)
-        VALUES (?, ?, ?)
-        ON CONFLICT(keyword) DO UPDATE SET
+        INSERT INTO category_memory (user_id, keyword, category, updated_at)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(user_id, keyword) DO UPDATE SET
             category = excluded.category,
             updated_at = excluded.updated_at
-    """, (keyword, category, datetime.now().isoformat()))
+    """, (user_id, keyword, category, datetime.now().isoformat()))
     conn.commit()
     conn.close()
 
 
-def get_memory_matches(text: str):
+def get_memory_matches(user_id: int, text: str):
     text_lower = text.lower()
 
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_conn()
     cur = conn.cursor()
-    cur.execute("SELECT keyword, category FROM category_memory")
+    cur.execute(
+        "SELECT keyword, category FROM category_memory WHERE user_id = ?",
+        (user_id,)
+    )
     rows = cur.fetchall()
     conn.close()
 
@@ -261,31 +291,29 @@ def analyze_message_with_ai(user_text: str, memory_hint: str) -> dict:
 Потрібно визначити намір користувача і повернути лише JSON за схемою.
 
 Дозволені intent:
-- add_expense: користувач каже про витрату
-- set_budget: користувач встановлює бюджет
-- check_purchase: користувач питає, чи може щось купити
-- correct_last_category: користувач виправляє категорію останньої витрати
-- teach_category: користувач вчить тебе правилу, наприклад "кава це їжа"
-- get_budget: питає який зараз бюджет
-- get_remaining: питає скільки залишилось від бюджету
-- get_spent: питає скільки вже витрачено
-- general_chat: проста розмова, похвала, коротке запитання без фінансової дії
-- unknown: якщо зовсім незрозуміло
+- add_expense
+- set_budget
+- check_purchase
+- correct_last_category
+- teach_category
+- get_budget
+- get_remaining
+- get_spent
+- general_chat
+- unknown
 
 Правила:
 - Розумій українську, російську, англійську, естонську.
-- Фрази типу "який у мене бюджет", "скільки бюджет", "мій бюджет" => get_budget
-- Фрази типу "скільки лишилось", "що залишилось від бюджету", "скільки в мене ще є" => get_remaining
-- Фрази типу "скільки я витратив", "які витрати", "скільки вже пішло" => get_spent
-- Фрази типу "молодець", "дякую", "ок", "супер" => general_chat
-- Якщо користувач каже "це їжа", "ні це транспорт" => correct_last_category
-- Якщо користувач каже "кава це їжа", "bolt це транспорт" => teach_category
+- "який у мене бюджет" => get_budget
+- "скільки лишилось", "що залишилось від бюджету" => get_remaining
+- "скільки я витратив" => get_spent
+- "це їжа", "ні це транспорт" => correct_last_category
+- "кава це їжа", "bolt це транспорт" => teach_category
 - category використовуй одну з:
   food, transport, shopping, health, entertainment, home, other
 - amount = null, якщо суми немає
-- keyword тільки для teach_category, інакше null
-- reply_text короткою, природною українською
-- Якщо повідомлення схоже на криво розпізнане голосове і сенс неясний, краще став unknown, а reply_text зроби з проханням повторити
+- keyword тільки для teach_category
+- reply_text короткою природною українською
 
 Пам'ять:
 {memory_hint}
@@ -300,7 +328,7 @@ def analyze_message_with_ai(user_text: str, memory_hint: str) -> dict:
         text={
             "format": {
                 "type": "json_schema",
-                "name": "finance_intent_v4",
+                "name": "finance_intent_multiuser",
                 "strict": True,
                 "schema": schema
             }
@@ -320,7 +348,9 @@ def transcribe_audio_file(file_path: str) -> str:
 
 
 async def process_finance_text(update: Update, user_text: str):
-    memory_matches = get_memory_matches(user_text)
+    user_id = update.effective_user.id
+
+    memory_matches = get_memory_matches(user_id, user_text)
     if memory_matches:
         memory_hint = "Відомі відповідності: " + ", ".join(
             [f"{k} -> {v}" for k, v in memory_matches]
@@ -342,7 +372,7 @@ async def process_finance_text(update: Update, user_text: str):
             await update.message.reply_text("Я зрозумів, що ти хочеш мене навчити, але не вистачає даних.")
             return
 
-        save_category_memory(keyword, category)
+        save_category_memory(user_id, keyword, category)
         await update.message.reply_text(
             f"{reply_text}\nЗапам'ятав: {keyword} → {category}"
         )
@@ -353,16 +383,16 @@ async def process_finance_text(update: Update, user_text: str):
             await update.message.reply_text("Я зрозумів, що ти виправляєш категорію, але не зміг визначити нову.")
             return
 
-        ok = update_last_expense_category(category)
+        ok = update_last_expense_category(user_id, category)
         if not ok:
-            await update.message.reply_text("Немає останньої витрати, яку можна виправити.")
+            await update.message.reply_text("У тебе ще немає останньої витрати, яку можна виправити.")
             return
 
-        last_expense = get_last_expense()
+        last_expense = get_last_expense(user_id)
         if last_expense:
             _, _, _, last_description, _ = last_expense
             if last_description:
-                save_category_memory(last_description, category)
+                save_category_memory(user_id, last_description, category)
 
         await update.message.reply_text(
             f"{reply_text}\nОстанню витрату оновлено на категорію: {category}"
@@ -378,7 +408,7 @@ async def process_finance_text(update: Update, user_text: str):
             category = memory_matches[0][1]
 
         amount_cents = int(Decimal(str(amount)) * 100)
-        add_expense(amount_cents, category, description)
+        add_expense(user_id, amount_cents, category, description)
 
         await update.message.reply_text(
             f"{reply_text}\n"
@@ -394,7 +424,7 @@ async def process_finance_text(update: Update, user_text: str):
             return
 
         amount_cents = int(Decimal(str(amount)) * 100)
-        set_budget(amount_cents)
+        set_budget(user_id, amount_cents)
 
         await update.message.reply_text(
             f"{reply_text}\nНовий бюджет: {cents_to_eur(amount_cents)}"
@@ -407,7 +437,7 @@ async def process_finance_text(update: Update, user_text: str):
             return
 
         purchase_cents = int(Decimal(str(amount)) * 100)
-        left = get_remaining_budget()
+        left = get_remaining_budget(user_id)
         after_purchase = left - purchase_cents
 
         if purchase_cents <= left:
@@ -426,16 +456,16 @@ async def process_finance_text(update: Update, user_text: str):
         return
 
     if intent == "get_budget":
-        budget = get_current_budget()
+        budget = get_current_budget(user_id)
         await update.message.reply_text(
             f"{reply_text}\nПоточний бюджет: {cents_to_eur(budget)}"
         )
         return
 
     if intent == "get_remaining":
-        left = get_remaining_budget()
-        budget = get_current_budget()
-        spent = get_total_expenses()
+        left = get_remaining_budget(user_id)
+        budget = get_current_budget(user_id)
+        spent = get_total_expenses(user_id)
         await update.message.reply_text(
             f"{reply_text}\n"
             f"Бюджет: {cents_to_eur(budget)}\n"
@@ -445,7 +475,7 @@ async def process_finance_text(update: Update, user_text: str):
         return
 
     if intent == "get_spent":
-        spent = get_total_expenses()
+        spent = get_total_expenses(user_id)
         await update.message.reply_text(
             f"{reply_text}\nУсього витрачено: {cents_to_eur(spent)}"
         )
@@ -459,36 +489,37 @@ async def process_finance_text(update: Update, user_text: str):
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (
-        "Привіт. Я розумний бот для бюджету.\n\n"
-        "Я розумію текст і голосові.\n"
-        "Можна питати:\n"
+    await update.message.reply_text(
+        "Привіт. Я багатокористувацький бот для бюджету.\n\n"
+        "У кожного тут свої окремі дані.\n"
+        "Можеш писати:\n"
         "• бюджет 1000\n"
         "• кава 4\n"
         "• скільки я витратив\n"
-        "• скільки мені лишилось\n"
-        "• який у мене бюджет\n"
-        "• чи можу купити навушники за 80\n"
+        "• скільки лишилось\n"
         "• це їжа\n"
         "• bolt це транспорт"
     )
-    await update.message.reply_text(text)
 
 
 async def budget_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+
     if not context.args:
         await update.message.reply_text("Напиши так: /budget 1200")
         return
 
     try:
         amount_cents = eur_to_cents(context.args[0])
-        set_budget(amount_cents)
+        set_budget(user_id, amount_cents)
         await update.message.reply_text(f"Бюджет встановлено: {cents_to_eur(amount_cents)}")
     except (InvalidOperation, ValueError):
         await update.message.reply_text("Не зміг зрозуміти суму. Приклад: /budget 1200")
 
 
 async def add_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+
     if len(context.args) < 2:
         await update.message.reply_text("Напиши так: /add 12.50 food кава")
         return
@@ -498,7 +529,7 @@ async def add_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         category = normalize_category(context.args[1])
         description = " ".join(context.args[2:]) if len(context.args) > 2 else ""
 
-        add_expense(amount_cents, category, description)
+        add_expense(user_id, amount_cents, category, description)
 
         await update.message.reply_text(
             f"Записав витрату.\n"
@@ -511,13 +542,15 @@ async def add_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def spent_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    total = get_total_expenses()
+    user_id = update.effective_user.id
+    total = get_total_expenses(user_id)
     await update.message.reply_text(f"Усього витрачено: {cents_to_eur(total)}")
 
 
 async def left_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    budget = get_current_budget()
-    spent = get_total_expenses()
+    user_id = update.effective_user.id
+    budget = get_current_budget(user_id)
+    spent = get_total_expenses(user_id)
     left = budget - spent
 
     await update.message.reply_text(
@@ -528,14 +561,16 @@ async def left_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def can_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+
     if not context.args:
         await update.message.reply_text("Напиши так: /can 80")
         return
 
     try:
         purchase_cents = eur_to_cents(context.args[0])
-        budget = get_current_budget()
-        spent = get_total_expenses()
+        budget = get_current_budget(user_id)
+        spent = get_total_expenses(user_id)
         left = budget - spent
         after_purchase = left - purchase_cents
 
@@ -563,7 +598,7 @@ async def smart_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
     except Exception as e:
         print("TEXT AI error:", e)
         await update.message.reply_text(
-            "Сталася помилка при обробці тексту. Перевір кредити API, ключ і код."
+            "Сталася помилка при обробці тексту."
         )
 
 
@@ -612,7 +647,7 @@ async def voice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         print("VOICE error:", e)
         await update.message.reply_text(
-            "Сталася помилка при обробці голосового. Перевір кредити API або повтори голосове чіткіше."
+            "Сталася помилка при обробці голосового."
         )
     finally:
         if temp_path and os.path.exists(temp_path):
@@ -637,7 +672,7 @@ def main():
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, voice_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, smart_text_handler))
 
-    print("AI-бот v4 запущений...")
+    print("AI multi-user бот запущений...")
     app.run_polling()
 
 
