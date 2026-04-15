@@ -25,6 +25,15 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 
 DB_NAME = "budget.db"
 
+# ВСТАВ СЮДИ СВІЙ TELEGRAM USER ID
+ADMIN_ID = 769150530
+
+# Якщо True — тільки дозволені користувачі можуть користуватися ботом
+REQUIRE_APPROVAL = True
+
+# Коди інвайту. Потім зможеш додати свої.
+VALID_INVITE_CODES = {"start123", "vip123", "friend123"}
+
 
 def get_conn():
     return sqlite3.connect(DB_NAME)
@@ -33,6 +42,19 @@ def get_conn():
 def init_db():
     conn = get_conn()
     cur = conn.cursor()
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        telegram_user_id INTEGER NOT NULL UNIQUE,
+        username TEXT,
+        first_name TEXT,
+        access_status TEXT NOT NULL DEFAULT 'pending',
+        invite_code TEXT,
+        created_at TEXT NOT NULL,
+        last_seen_at TEXT NOT NULL
+    )
+    """)
 
     cur.execute("""
     CREATE TABLE IF NOT EXISTS expenses (
@@ -80,16 +102,135 @@ def cents_to_eur(cents: int) -> str:
     return f"{euros:.2f} €"
 
 
-def add_expense(user_id: int, amount_cents: int, category: str, description: str):
+def upsert_user(telegram_user_id: int, username: str | None, first_name: str | None, invite_code: str | None = None):
+    conn = get_conn()
+    cur = conn.cursor()
+    now = datetime.now().isoformat()
+
+    cur.execute("SELECT access_status, invite_code FROM users WHERE telegram_user_id = ?", (telegram_user_id,))
+    existing = cur.fetchone()
+
+    if existing:
+        old_status, old_invite = existing
+        final_status = old_status
+
+        if telegram_user_id == ADMIN_ID:
+            final_status = "active"
+        elif old_status == "pending" and invite_code and invite_code in VALID_INVITE_CODES:
+            final_status = "active"
+
+        cur.execute("""
+            UPDATE users
+            SET username = ?, first_name = ?, invite_code = ?, access_status = ?, last_seen_at = ?
+            WHERE telegram_user_id = ?
+        """, (
+            username,
+            first_name,
+            invite_code or old_invite,
+            final_status,
+            now,
+            telegram_user_id
+        ))
+    else:
+        status = "pending"
+        if telegram_user_id == ADMIN_ID:
+            status = "active"
+        elif invite_code and invite_code in VALID_INVITE_CODES:
+            status = "active"
+
+        cur.execute("""
+            INSERT INTO users (telegram_user_id, username, first_name, access_status, invite_code, created_at, last_seen_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (
+            telegram_user_id,
+            username,
+            first_name,
+            status,
+            invite_code,
+            now,
+            now
+        ))
+
+    conn.commit()
+    conn.close()
+
+
+def get_user_row(telegram_user_id: int):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT telegram_user_id, username, first_name, access_status, invite_code, created_at, last_seen_at
+        FROM users
+        WHERE telegram_user_id = ?
+    """, (telegram_user_id,))
+    row = cur.fetchone()
+    conn.close()
+    return row
+
+
+def get_user_access_status(telegram_user_id: int) -> str:
+    row = get_user_row(telegram_user_id)
+    if not row:
+        return "pending"
+    return row[3]
+
+
+def allow_user(telegram_user_id: int):
     conn = get_conn()
     cur = conn.cursor()
     cur.execute(
-        """
+        "UPDATE users SET access_status = 'active' WHERE telegram_user_id = ?",
+        (telegram_user_id,)
+    )
+    conn.commit()
+    conn.close()
+
+
+def block_user(telegram_user_id: int):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "UPDATE users SET access_status = 'blocked' WHERE telegram_user_id = ?",
+        (telegram_user_id,)
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_all_users(limit: int = 50):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT telegram_user_id, username, first_name, access_status, invite_code, created_at, last_seen_at
+        FROM users
+        ORDER BY created_at DESC
+        LIMIT ?
+    """, (limit,))
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
+def delete_user_data(telegram_user_id: int):
+    conn = get_conn()
+    cur = conn.cursor()
+
+    cur.execute("DELETE FROM expenses WHERE user_id = ?", (telegram_user_id,))
+    cur.execute("DELETE FROM budgets WHERE user_id = ?", (telegram_user_id,))
+    cur.execute("DELETE FROM category_memory WHERE user_id = ?", (telegram_user_id,))
+    cur.execute("DELETE FROM users WHERE telegram_user_id = ?", (telegram_user_id,))
+
+    conn.commit()
+    conn.close()
+
+
+def add_expense(user_id: int, amount_cents: int, category: str, description: str):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
         INSERT INTO expenses (user_id, amount_cents, category, description, created_at)
         VALUES (?, ?, ?, ?, ?)
-        """,
-        (user_id, amount_cents, category, description, datetime.now().isoformat())
-    )
+    """, (user_id, amount_cents, category, description, datetime.now().isoformat()))
     conn.commit()
     conn.close()
 
@@ -135,13 +276,10 @@ def get_last_expense(user_id: int):
 def set_budget(user_id: int, amount_cents: int):
     conn = get_conn()
     cur = conn.cursor()
-    cur.execute(
-        """
+    cur.execute("""
         INSERT INTO budgets (user_id, amount_cents, created_at)
         VALUES (?, ?, ?)
-        """,
-        (user_id, amount_cents, datetime.now().isoformat())
-    )
+    """, (user_id, amount_cents, datetime.now().isoformat()))
     conn.commit()
     conn.close()
 
@@ -245,7 +383,88 @@ def normalize_category(raw):
 
     return mapping.get(value, value)
 
+def try_rule_based_intent(user_text: str):
+    text = user_text.strip().lower().replace(",", ".")
 
+    # Встановлення бюджету
+    budget_phrases = [
+        "бюджет ",
+        "мій бюджет ",
+        "мой бюджет ",
+        "my budget ",
+        "set budget ",
+        "budget "
+    ]
+
+    for phrase in budget_phrases:
+        if text.startswith(phrase):
+            rest = text[len(phrase):].strip()
+            try:
+                amount = float(rest)
+                return {
+                    "intent": "set_budget",
+                    "amount": amount,
+                    "category": None,
+                    "description": None,
+                    "keyword": None,
+                    "reply_text": "Добре, встановлюю бюджет."
+                }
+            except ValueError:
+                pass
+
+    # Питання про поточний бюджет
+    get_budget_phrases = [
+        "який у мене бюджет",
+        "мой бюджет",
+        "what is my budget",
+        "mis on mu eelarve"
+    ]
+    if text in get_budget_phrases:
+        return {
+            "intent": "get_budget",
+            "amount": None,
+            "category": None,
+            "description": None,
+            "keyword": None,
+            "reply_text": "Ось твій поточний бюджет."
+        }
+
+    # Скільки витрачено
+    get_spent_phrases = [
+        "скільки я витратив",
+        "скільки я витратила",
+        "сколько я потратил",
+        "how much did i spend"
+    ]
+    if text in get_spent_phrases:
+        return {
+            "intent": "get_spent",
+            "amount": None,
+            "category": None,
+            "description": None,
+            "keyword": None,
+            "reply_text": "Ось скільки ти вже витратив."
+        }
+
+    # Скільки залишилось
+    get_remaining_phrases = [
+        "скільки лишилось",
+        "скільки залишилось",
+        "що залишилось від бюджету",
+        "сколько осталось",
+        "how much is left"
+    ]
+    if text in get_remaining_phrases:
+        return {
+            "intent": "get_remaining",
+            "amount": None,
+            "category": None,
+            "description": None,
+            "keyword": None,
+            "reply_text": "Ось твій залишок."
+        }
+
+    return None
 def analyze_message_with_ai(user_text: str, memory_hint: str) -> dict:
     schema = {
         "type": "object",
@@ -265,21 +484,11 @@ def analyze_message_with_ai(user_text: str, memory_hint: str) -> dict:
                     "unknown"
                 ]
             },
-            "amount": {
-                "type": ["number", "null"]
-            },
-            "category": {
-                "type": ["string", "null"]
-            },
-            "description": {
-                "type": ["string", "null"]
-            },
-            "keyword": {
-                "type": ["string", "null"]
-            },
-            "reply_text": {
-                "type": "string"
-            }
+            "amount": {"type": ["number", "null"]},
+            "category": {"type": ["string", "null"]},
+            "description": {"type": ["string", "null"]},
+            "keyword": {"type": ["string", "null"]},
+            "reply_text": {"type": "string"}
         },
         "required": ["intent", "amount", "category", "description", "keyword", "reply_text"],
         "additionalProperties": False
@@ -288,7 +497,7 @@ def analyze_message_with_ai(user_text: str, memory_hint: str) -> dict:
     prompt = f"""
 Ти розумний фінансовий Telegram-асистент.
 
-Потрібно визначити намір користувача і повернути лише JSON за схемою.
+Визнач намір користувача і поверни лише JSON за схемою.
 
 Дозволені intent:
 - add_expense
@@ -314,7 +523,16 @@ def analyze_message_with_ai(user_text: str, memory_hint: str) -> dict:
 - amount = null, якщо суми немає
 - keyword тільки для teach_category
 - reply_text короткою природною українською
-
+- Якщо користувач пише "бюджет 1000", "мій бюджет 1000", "мой бюджет 1000", "my budget 1000" — це set_budget
+- Якщо користувач пише "який у мене бюджет", "мой бюджет?", "what is my budget" — це get_budget
+- Якщо в повідомленні є слово про бюджет і конкретне число без знака питання — найчастіше це set_budget
+- reply_text не повинен містити конкретних чисел бюджету, залишку, витрат або сум з бази.
+- reply_text має бути лише короткою фразою без вигаданих чисел.
+- Для intent get_budget, get_remaining, get_spent, check_purchase reply_text має бути загальною фразою, наприклад:
+  "Ось твоя інформація."
+  "Зараз покажу."
+  "Перевіряю."
+- Ніколи не вигадуй числа у reply_text.
 Пам'ять:
 {memory_hint}
 
@@ -328,7 +546,7 @@ def analyze_message_with_ai(user_text: str, memory_hint: str) -> dict:
         text={
             "format": {
                 "type": "json_schema",
-                "name": "finance_intent_multiuser",
+                "name": "finance_access_control",
                 "strict": True,
                 "schema": schema
             }
@@ -347,6 +565,37 @@ def transcribe_audio_file(file_path: str) -> str:
     return transcription.text.strip()
 
 
+def user_has_access(telegram_user_id: int) -> bool:
+    if telegram_user_id == ADMIN_ID:
+        return True
+
+    if not REQUIRE_APPROVAL:
+        return True
+
+    status = get_user_access_status(telegram_user_id)
+    return status == "active"
+
+
+async def ensure_access(update: Update) -> bool:
+    user = update.effective_user
+    if not user:
+        return False
+
+    if user_has_access(user.id):
+        return True
+
+    status = get_user_access_status(user.id)
+
+    if status == "blocked":
+        await update.message.reply_text("Твій доступ до бота вимкнений.")
+        return False
+
+    await update.message.reply_text(
+        "Доступ ще не активований. Напиши адміну, щоб він тебе дозволив."
+    )
+    return False
+
+
 async def process_finance_text(update: Update, user_text: str):
     user_id = update.effective_user.id
 
@@ -358,8 +607,12 @@ async def process_finance_text(update: Update, user_text: str):
     else:
         memory_hint = "Наразі точних збігів у пам'яті не знайдено."
 
-    data = analyze_message_with_ai(user_text, memory_hint)
+    rule_result = try_rule_based_intent(user_text)
 
+if rule_result:
+    data = rule_result
+else:
+    data = analyze_message_with_ai(user_text, memory_hint)
     intent = data.get("intent")
     amount = data.get("amount")
     category = normalize_category(data.get("category"))
@@ -373,9 +626,7 @@ async def process_finance_text(update: Update, user_text: str):
             return
 
         save_category_memory(user_id, keyword, category)
-        await update.message.reply_text(
-            f"{reply_text}\nЗапам'ятав: {keyword} → {category}"
-        )
+        await update.message.reply_text(f"{reply_text}\nЗапам'ятав: {keyword} → {category}")
         return
 
     if intent == "correct_last_category":
@@ -394,9 +645,7 @@ async def process_finance_text(update: Update, user_text: str):
             if last_description:
                 save_category_memory(user_id, last_description, category)
 
-        await update.message.reply_text(
-            f"{reply_text}\nОстанню витрату оновлено на категорію: {category}"
-        )
+        await update.message.reply_text(f"{reply_text}\nОстанню витрату оновлено на категорію: {category}")
         return
 
     if intent == "add_expense":
@@ -411,98 +660,201 @@ async def process_finance_text(update: Update, user_text: str):
         add_expense(user_id, amount_cents, category, description)
 
         await update.message.reply_text(
-            f"{reply_text}\n"
-            f"Сума: {cents_to_eur(amount_cents)}\n"
-            f"Категорія: {category}\n"
-            f"Опис: {description}"
+            f"{reply_text}\nСума: {cents_to_eur(amount_cents)}\nКатегорія: {category}\nОпис: {description}"
         )
         return
 
     if intent == "set_budget":
-        if amount is None:
-            await update.message.reply_text("Я зрозумів, що ти хочеш встановити бюджет, але не бачу суму.")
-            return
-
-        amount_cents = int(Decimal(str(amount)) * 100)
-        set_budget(user_id, amount_cents)
-
-        await update.message.reply_text(
-            f"{reply_text}\nНовий бюджет: {cents_to_eur(amount_cents)}"
-        )
+    if amount is None:
+        await update.message.reply_text("Я зрозумів, що ти хочеш встановити бюджет, але не бачу суму.")
         return
+
+    amount_cents = int(Decimal(str(amount)) * 100)
+    set_budget(user_id, amount_cents)
+
+    await update.message.reply_text(
+        f"Бюджет встановлено.\nНовий бюджет: {cents_to_eur(amount_cents)}"
+    )
+    return
 
     if intent == "check_purchase":
-        if amount is None:
-            await update.message.reply_text("Я зрозумів, що ти хочеш перевірити покупку, але не бачу суму.")
-            return
-
-        purchase_cents = int(Decimal(str(amount)) * 100)
-        left = get_remaining_budget(user_id)
-        after_purchase = left - purchase_cents
-
-        if purchase_cents <= left:
-            await update.message.reply_text(
-                f"{reply_text}\n"
-                f"Зараз залишок: {cents_to_eur(left)}\n"
-                f"Після покупки залишиться: {cents_to_eur(after_purchase)}"
-            )
-        else:
-            need_more = purchase_cents - left
-            await update.message.reply_text(
-                f"{reply_text}\n"
-                f"Зараз залишок: {cents_to_eur(left)}\n"
-                f"Не вистачає: {cents_to_eur(need_more)}"
-            )
+    if amount is None:
+        await update.message.reply_text("Я зрозумів, що ти хочеш перевірити покупку, але не бачу суму.")
         return
+
+    purchase_cents = int(Decimal(str(amount)) * 100)
+    left = get_remaining_budget(user_id)
+    after_purchase = left - purchase_cents
+
+    if purchase_cents <= left:
+        await update.message.reply_text(
+            f"Так, ця покупка влізає в бюджет.\n"
+            f"Зараз залишок: {cents_to_eur(left)}\n"
+            f"Після покупки залишиться: {cents_to_eur(after_purchase)}"
+        )
+    else:
+        need_more = purchase_cents - left
+        await update.message.reply_text(
+            f"Ні, ця покупка не влізає в бюджет.\n"
+            f"Зараз залишок: {cents_to_eur(left)}\n"
+            f"Не вистачає: {cents_to_eur(need_more)}"
+        )
+    return
 
     if intent == "get_budget":
-        budget = get_current_budget(user_id)
-        await update.message.reply_text(
-            f"{reply_text}\nПоточний бюджет: {cents_to_eur(budget)}"
-        )
-        return
+    budget = get_current_budget(user_id)
+    await update.message.reply_text(
+        f"Ось твій поточний бюджет:\n{cents_to_eur(budget)}"
+    )
+    return
 
     if intent == "get_remaining":
-        left = get_remaining_budget(user_id)
-        budget = get_current_budget(user_id)
-        spent = get_total_expenses(user_id)
-        await update.message.reply_text(
-            f"{reply_text}\n"
-            f"Бюджет: {cents_to_eur(budget)}\n"
-            f"Витрачено: {cents_to_eur(spent)}\n"
-            f"Залишилось: {cents_to_eur(left)}"
-        )
-        return
+    left = get_remaining_budget(user_id)
+    budget = get_current_budget(user_id)
+    spent = get_total_expenses(user_id)
+    await update.message.reply_text(
+        f"Ось твоя інформація по бюджету:\n"
+        f"Бюджет: {cents_to_eur(budget)}\n"
+        f"Витрачено: {cents_to_eur(spent)}\n"
+        f"Залишилось: {cents_to_eur(left)}"
+    )
+    return
 
     if intent == "get_spent":
-        spent = get_total_expenses(user_id)
-        await update.message.reply_text(
-            f"{reply_text}\nУсього витрачено: {cents_to_eur(spent)}"
-        )
-        return
-
-    if intent == "general_chat":
-        await update.message.reply_text(reply_text)
-        return
+    spent = get_total_expenses(user_id)
+    await update.message.reply_text(
+        f"Усього витрачено: {cents_to_eur(spent)}"
+    )
+    return
 
     await update.message.reply_text(reply_text)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not user:
+        return
+
+    invite_code = context.args[0] if context.args else None
+    upsert_user(user.id, user.username, user.first_name, invite_code)
+
+    status = get_user_access_status(user.id)
+
+    if user.id == ADMIN_ID:
+        await update.message.reply_text(
+            "Привіт, адміне. Ти маєш повний доступ.\n\n"
+            "Команди:\n"
+            "/admin_users\n"
+            "/admin_allow ID\n"
+            "/admin_block ID\n"
+            "/admin_delete_user ID"
+        )
+        return
+
+    if REQUIRE_APPROVAL and status != "active":
+        if invite_code and invite_code in VALID_INVITE_CODES:
+            await update.message.reply_text(
+                "Готово, доступ активовано.\n"
+                "Тепер твої дані будуть окремими від інших."
+            )
+        else:
+            await update.message.reply_text(
+                "Ти підключився до бота, але доступ ще не активований.\n"
+                "Попроси адміна дозволити тебе або зайди по інвайт-посиланню."
+            )
+        return
+
     await update.message.reply_text(
-        "Привіт. Я багатокористувацький бот для бюджету.\n\n"
-        "У кожного тут свої окремі дані.\n"
+        "Привіт. У тебе окремий профіль у боті.\n"
+        "Твої витрати, бюджет і пам'ять не змішуються з іншими.\n\n"
         "Можеш писати:\n"
         "• бюджет 1000\n"
         "• кава 4\n"
         "• скільки я витратив\n"
-        "• скільки лишилось\n"
-        "• це їжа\n"
-        "• bolt це транспорт"
+        "• скільки лишилось"
     )
 
 
+async def admin_users_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("Немає доступу.")
+        return
+
+    rows = get_all_users()
+
+    if not rows:
+        await update.message.reply_text("Користувачів поки немає.")
+        return
+
+    lines = []
+    for tg_id, username, first_name, status, invite_code, created_at, last_seen_at in rows:
+        lines.append(
+            f"ID: {tg_id}\n"
+            f"Ім'я: {first_name or '-'}\n"
+            f"Username: @{username or '-'}\n"
+            f"Статус: {status}\n"
+            f"Інвайт: {invite_code or '-'}"
+        )
+
+    text = "\n\n".join(lines[:20])
+    await update.message.reply_text(text)
+
+
+async def admin_allow_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("Немає доступу.")
+        return
+
+    if not context.args:
+        await update.message.reply_text("Напиши так: /admin_allow 123456789")
+        return
+
+    try:
+        target_id = int(context.args[0])
+        allow_user(target_id)
+        await update.message.reply_text(f"Доступ дозволено для {target_id}")
+    except ValueError:
+        await update.message.reply_text("ID має бути числом.")
+
+
+async def admin_block_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("Немає доступу.")
+        return
+
+    if not context.args:
+        await update.message.reply_text("Напиши так: /admin_block 123456789")
+        return
+
+    try:
+        target_id = int(context.args[0])
+        block_user(target_id)
+        await update.message.reply_text(f"Користувача {target_id} заблоковано.")
+    except ValueError:
+        await update.message.reply_text("ID має бути числом.")
+
+
+async def admin_delete_user_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("Немає доступу.")
+        return
+
+    if not context.args:
+        await update.message.reply_text("Напиши так: /admin_delete_user 123456789")
+        return
+
+    try:
+        target_id = int(context.args[0])
+        delete_user_data(target_id)
+        await update.message.reply_text(f"Дані користувача {target_id} повністю видалено.")
+    except ValueError:
+        await update.message.reply_text("ID має бути числом.")
+
+
 async def budget_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await ensure_access(update):
+        return
+
     user_id = update.effective_user.id
 
     if not context.args:
@@ -518,6 +870,9 @@ async def budget_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def add_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await ensure_access(update):
+        return
+
     user_id = update.effective_user.id
 
     if len(context.args) < 2:
@@ -532,35 +887,39 @@ async def add_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         add_expense(user_id, amount_cents, category, description)
 
         await update.message.reply_text(
-            f"Записав витрату.\n"
-            f"Сума: {cents_to_eur(amount_cents)}\n"
-            f"Категорія: {category}\n"
-            f"Опис: {description if description else '-'}"
+            f"Записав витрату.\nСума: {cents_to_eur(amount_cents)}\nКатегорія: {category}\nОпис: {description if description else '-'}"
         )
     except (InvalidOperation, ValueError):
         await update.message.reply_text("Не зміг зрозуміти суму. Приклад: /add 12.50 food кава")
 
 
 async def spent_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await ensure_access(update):
+        return
+
     user_id = update.effective_user.id
     total = get_total_expenses(user_id)
     await update.message.reply_text(f"Усього витрачено: {cents_to_eur(total)}")
 
 
 async def left_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await ensure_access(update):
+        return
+
     user_id = update.effective_user.id
     budget = get_current_budget(user_id)
     spent = get_total_expenses(user_id)
     left = budget - spent
 
     await update.message.reply_text(
-        f"Бюджет: {cents_to_eur(budget)}\n"
-        f"Витрачено: {cents_to_eur(spent)}\n"
-        f"Залишилось: {cents_to_eur(left)}"
+        f"Бюджет: {cents_to_eur(budget)}\nВитрачено: {cents_to_eur(spent)}\nЗалишилось: {cents_to_eur(left)}"
     )
 
 
 async def can_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await ensure_access(update):
+        return
+
     user_id = update.effective_user.id
 
     if not context.args:
@@ -576,33 +935,33 @@ async def can_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if purchase_cents <= left:
             await update.message.reply_text(
-                f"Так, влізаєш.\n"
-                f"Зараз залишок: {cents_to_eur(left)}\n"
-                f"Після покупки залишиться: {cents_to_eur(after_purchase)}"
+                f"Так, влізаєш.\nЗараз залишок: {cents_to_eur(left)}\nПісля покупки залишиться: {cents_to_eur(after_purchase)}"
             )
         else:
             over = purchase_cents - left
             await update.message.reply_text(
-                f"Ні, не влізаєш у бюджет.\n"
-                f"Зараз залишок: {cents_to_eur(left)}\n"
-                f"Не вистачає: {cents_to_eur(over)}"
+                f"Ні, не влізаєш у бюджет.\nЗараз залишок: {cents_to_eur(left)}\nНе вистачає: {cents_to_eur(over)}"
             )
     except (InvalidOperation, ValueError):
         await update.message.reply_text("Не зміг зрозуміти суму. Приклад: /can 80")
 
 
 async def smart_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await ensure_access(update):
+        return
+
     try:
         user_text = update.message.text.strip()
         await process_finance_text(update, user_text)
     except Exception as e:
         print("TEXT AI error:", e)
-        await update.message.reply_text(
-            "Сталася помилка при обробці тексту."
-        )
+        await update.message.reply_text("Сталася помилка при обробці тексту.")
 
 
 async def voice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await ensure_access(update):
+        return
+
     temp_path = None
 
     try:
@@ -646,9 +1005,7 @@ async def voice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     except Exception as e:
         print("VOICE error:", e)
-        await update.message.reply_text(
-            "Сталася помилка при обробці голосового."
-        )
+        await update.message.reply_text("Сталася помилка при обробці голосового.")
     finally:
         if temp_path and os.path.exists(temp_path):
             try:
@@ -669,10 +1026,15 @@ def main():
     app.add_handler(CommandHandler("left", left_command))
     app.add_handler(CommandHandler("can", can_command))
 
+    app.add_handler(CommandHandler("admin_users", admin_users_command))
+    app.add_handler(CommandHandler("admin_allow", admin_allow_command))
+    app.add_handler(CommandHandler("admin_block", admin_block_command))
+    app.add_handler(CommandHandler("admin_delete_user", admin_delete_user_command))
+
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, voice_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, smart_text_handler))
 
-    print("AI multi-user бот запущений...")
+    print("AI access-control бот запущений...")
     app.run_polling()
 
 
